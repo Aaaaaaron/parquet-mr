@@ -656,10 +656,28 @@ public class ParquetFileReader implements Closeable {
     this.f = file.newStream();
     this.options = HadoopReadOptions.builder(configuration).build();
     this.blocks = filterRowGroups(blocks);
-    this.blockIndexStores = listWithNulls(this.blocks.size());
     this.blockRowRanges = listWithNulls(this.blocks.size());
     for (ColumnDescriptor col : columns) {
       paths.put(ColumnPath.get(col.getPath()), col);
+    }
+
+    // init blockIndexStores
+    if ("true".equalsIgnoreCase(System.getProperty("v2"))) {
+      long m = System.currentTimeMillis();
+//      getRowRanges();
+
+      this.blockIndexStores = new ArrayList<>(blocks.size());
+      for (BlockMetaData block : blocks) {
+        blockIndexStores.add(ColumnIndexStoreImpl.create(this, block, paths.keySet()));
+      }
+      for (ColumnIndexStore blockIndexStore : blockIndexStores) {
+        for (ColumnChunkMetaData chunkMetaData : blocks.get(0).getColumns()) {
+          blockIndexStore.getColumnIndex(chunkMetaData.getPath());
+        }
+      }
+      System.out.println("getColumnIndexStore(when initing) time:" + (System.currentTimeMillis() - m));
+    } else {
+      this.blockIndexStores = listWithNulls(this.blocks.size());
     }
   }
 
@@ -817,6 +835,7 @@ public class ParquetFileReader implements Closeable {
    * @return the PageReadStore which can provide PageReaders for each column.
    */
   public PageReadStore readNextRowGroup() throws IOException {
+    long l = System.currentTimeMillis();
     if (currentBlock == blocks.size()) {
       return null;
     }
@@ -857,7 +876,7 @@ public class ParquetFileReader implements Closeable {
     }
 
     advanceToNextBlock();
-
+    System.out.println("readNextRowGroup time:" + (System.currentTimeMillis() - l));
     return currentRowGroup;
   }
 
@@ -869,9 +888,9 @@ public class ParquetFileReader implements Closeable {
    * @return the PageReadStore which can provide PageReaders for each column
    * @throws IOException
    *           if any I/O error occurs while reading
-   * @see {@link PageReadStore#isInPageFilteringMode()}
    */
   public PageReadStore readNextFilteredRowGroup() throws IOException {
+    long s = System.currentTimeMillis();
     if (currentBlock == blocks.size()) {
       return null;
     }
@@ -882,8 +901,14 @@ public class ParquetFileReader implements Closeable {
     if (block.getRowCount() == 0) {
       throw new RuntimeException("Illegal row group of 0 rows");
     }
+    long m = System.currentTimeMillis();
     ColumnIndexStore ciStore = getColumnIndexStore(currentBlock);
+    System.out.println("getColumnIndexStore(without init) time:" + (System.currentTimeMillis() - m));
+
+    long l = System.currentTimeMillis();
     RowRanges rowRanges = getRowRanges(currentBlock);
+    System.out.println("get row range(without init) time:" + (System.currentTimeMillis() - l));
+
     long rowCount = rowRanges.rowCount();
     if (rowCount == 0) {
       // There are no matching rows -> skipping this row-group
@@ -907,7 +932,7 @@ public class ParquetFileReader implements Closeable {
         OffsetIndex offsetIndex = ciStore.getOffsetIndex(mc.getPath());
 
         OffsetIndex filteredOffsetIndex = filterOffsetIndex(offsetIndex, rowRanges,
-            block.getRowCount());
+          block.getRowCount());
         for (OffsetRange range : calculateOffsetRanges(filteredOffsetIndex, mc, offsetIndex.getOffset(0))) {
           BenchmarkCounter.incrementTotalBytes(range.getLength());
           long startingPos = range.getOffset();
@@ -917,7 +942,7 @@ public class ParquetFileReader implements Closeable {
             allParts.add(currentParts);
           }
           ChunkDescriptor chunkDescriptor = new ChunkDescriptor(columnDescriptor, mc, startingPos,
-              (int) range.getLength());
+            (int) range.getLength());
           currentParts.addChunk(chunkDescriptor);
           builder.setOffsetIndex(chunkDescriptor, filteredOffsetIndex);
         }
@@ -937,6 +962,82 @@ public class ParquetFileReader implements Closeable {
     }
 
     advanceToNextBlock();
+    System.out.println("readNextFilteredRowGroup time:" + (System.currentTimeMillis() - s));
+
+    return currentRowGroup;
+  }
+
+  public PageReadStore readNextFilteredRowGroup2() throws IOException {
+    long s = System.currentTimeMillis();
+
+    if (currentBlock == blocks.size()) {
+      return null;
+    }
+    if (!options.useColumnIndexFilter()) {
+      return readNextRowGroup();
+    }
+    BlockMetaData block = blocks.get(currentBlock);
+    if (block.getRowCount() == 0) {
+      throw new RuntimeException("Illegal row group of 0 rows");
+    }
+    ColumnIndexStore ciStore = blockIndexStores.get(currentBlock);
+    long l = System.currentTimeMillis();
+    RowRanges rowRanges = getRowRanges(currentBlock);
+    System.out.println("get row range(with filter):" + (System.currentTimeMillis() - l));
+    long rowCount = rowRanges.rowCount();
+    if (rowCount == 0) {
+      // There are no matching rows -> skipping this row-group
+      advanceToNextBlock();
+      return readNextFilteredRowGroup();
+    }
+    if (rowCount == block.getRowCount()) {
+      // All rows are matching -> fall back to the non-filtering path
+      return readNextRowGroup();
+    }
+
+    this.currentRowGroup = new ColumnChunkPageReadStore(rowRanges);
+    // prepare the list of consecutive parts to read them in one scan
+    ChunkListBuilder builder = new ChunkListBuilder();
+    List<ConsecutivePartList> allParts = new ArrayList<ConsecutivePartList>();
+    ConsecutivePartList currentParts = null;
+    for (ColumnChunkMetaData mc : block.getColumns()) {
+      ColumnPath pathKey = mc.getPath();
+      ColumnDescriptor columnDescriptor = paths.get(pathKey);
+      if (columnDescriptor != null) {
+        OffsetIndex offsetIndex = ciStore.getOffsetIndex(mc.getPath());
+
+        OffsetIndex filteredOffsetIndex = filterOffsetIndex(offsetIndex, rowRanges,
+          block.getRowCount());
+        for (OffsetRange range : calculateOffsetRanges(filteredOffsetIndex, mc, offsetIndex.getOffset(0))) {
+          BenchmarkCounter.incrementTotalBytes(range.getLength());
+          long startingPos = range.getOffset();
+          // first part or not consecutive => new list
+          if (currentParts == null || currentParts.endPos() != startingPos) {
+            currentParts = new ConsecutivePartList(startingPos);
+            allParts.add(currentParts);
+          }
+          ChunkDescriptor chunkDescriptor = new ChunkDescriptor(columnDescriptor, mc, startingPos,
+            (int) range.getLength());
+          currentParts.addChunk(chunkDescriptor);
+          builder.setOffsetIndex(chunkDescriptor, filteredOffsetIndex);
+        }
+      }
+    }
+    // actually read all the chunks
+    for (ConsecutivePartList consecutiveChunks : allParts) {
+      consecutiveChunks.readAll(f, builder);
+    }
+    for (Chunk chunk : builder.build()) {
+      currentRowGroup.addColumn(chunk.descriptor.col, chunk.readAllPages());
+    }
+
+    // avoid re-reading bytes the dictionary reader is used after this call
+    if (nextDictionaryReader != null) {
+      nextDictionaryReader.setRowGroup(currentRowGroup);
+    }
+
+    advanceToNextBlock();
+    System.out.println("readNextFilteredRowGroup2 time:" + (System.currentTimeMillis() - s));
 
     return currentRowGroup;
   }
@@ -1075,7 +1176,9 @@ public class ParquetFileReader implements Closeable {
     if (ref == null) {
       return null;
     }
-    f.seek(ref.getOffset());
+    long offset = ref.getOffset();
+    System.out.println("readOffsetIndex:" + offset);
+    f.seek(offset);
     return ParquetMetadataConverter.fromParquetOffsetIndex(Util.readOffsetIndex(f));
   }
 
@@ -1408,6 +1511,7 @@ public class ParquetFileReader implements Closeable {
      * @throws IOException if there is an error while reading from the stream
      */
     public void readAll(SeekableInputStream f, ChunkListBuilder builder) throws IOException {
+      System.out.println("read all offset:" + offset + ", length:" + length);
       List<ByteBuffer> buffers = readBlocks(f, offset, length);
 
       // report in a counter the data we just scanned

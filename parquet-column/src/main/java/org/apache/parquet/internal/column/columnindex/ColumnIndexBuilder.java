@@ -468,13 +468,7 @@ public abstract class ColumnIndexBuilder {
       List<Long> nullCounts,
       List<ByteBuffer> minValues,
       List<ByteBuffer> maxValues) {
-
-    PrimitiveTypeName typeName = type.getPrimitiveTypeName();
-    ColumnIndexBuilder builder = BUILDERS.get(typeName);
-    if (builder == null) {
-      builder = createNewBuilder(type, Integer.MAX_VALUE);
-      BUILDERS.put(typeName, builder);
-    }
+    ColumnIndexBuilder builder = createNewBuilder(type, Integer.MAX_VALUE);
 
     builder.fill(nullPages, nullCounts, minValues, maxValues);
     ColumnIndexBase<?> columnIndex = builder.build(type);
